@@ -3,8 +3,8 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
-	"strings"
 
 	"github.com/google/go-github/v60/github"
 	"golang.org/x/oauth2"
@@ -24,110 +24,108 @@ const (
 type Token struct {
 	Value     string
 	Type      TokenType
-	Scopes    []string
 	ExpiresAt *github.Timestamp
+	Client    *github.Client
 }
 
 // ValidateToken validates the GitHub token and returns its metadata
 func ValidateToken(ctx context.Context, tokenValue string) (*Token, error) {
+	log.Printf("[DEBUG] Validating GitHub token")
 	if tokenValue == "" {
 		return nil, fmt.Errorf("token cannot be empty")
 	}
 
-	// Create OAuth2 client
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: tokenValue},
-	)
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
+	// Create GitHub client
+	client := github.NewClient(nil).WithAuthToken(tokenValue)
 
 	// Get authenticated user to validate token
-	_, resp, err := client.Users.Get(ctx, "")
+	user, resp, err := client.Users.Get(ctx, "")
 	if err != nil {
+		log.Printf("[ERROR] Failed to validate token: %v", err)
+		if resp != nil && resp.StatusCode == 401 {
+			return nil, fmt.Errorf("invalid token: authentication failed")
+		}
 		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 
-	// Get token scopes from response header
-	scopesHeader := resp.Header.Get("X-OAuth-Scopes")
-	scopes := []string{}
-	if scopesHeader != "" {
-		for _, scope := range strings.Split(scopesHeader, ",") {
-			scopes = append(scopes, strings.TrimSpace(scope))
-		}
-	}
+	log.Printf("[INFO] Token validated successfully for user: %s", *user.Login)
 
-	// Determine token type based on scopes
+	// Determine token type based on response headers
 	tokenType := TokenTypeClassic
-	if strings.Contains(scopesHeader, "repository:") || strings.Contains(scopesHeader, "organization:") {
+	if resp.Header.Get("GitHub-Authentication-Token-Type") == "fine-grained" {
 		tokenType = TokenTypeFineGrained
+		log.Printf("[DEBUG] Detected fine-grained token")
+	} else {
+		log.Printf("[DEBUG] Detected classic token")
 	}
 
-	token := &Token{
+	return &Token{
 		Value:  tokenValue,
 		Type:   tokenType,
-		Scopes: scopes,
-	}
-
-	// Validate required scopes
-	if err := validateRequiredScopes(token); err != nil {
-		return nil, err
-	}
-
-	return token, nil
+		Client: client,
+	}, nil
 }
 
-// validateRequiredScopes checks if the token has the required scopes
-func validateRequiredScopes(token *Token) error {
-	requiredScopes := map[string]bool{
-		"repo":     false,
-		"read:org": false,
-	}
+// CheckOrganizationAccess verifies if the token has access to the specified organization
+func (t *Token) CheckOrganizationAccess(ctx context.Context, orgName string) (bool, error) {
+	log.Printf("[DEBUG] Checking access to organization: %s", orgName)
 
-	// For classic tokens, check the exact scope names
-	if token.Type == TokenTypeClassic {
-		for _, scope := range token.Scopes {
-			if _, ok := requiredScopes[scope]; ok {
-				requiredScopes[scope] = true
-			}
+	org, resp, err := t.Client.Organizations.Get(ctx, orgName)
+	if err != nil {
+		if resp != nil && resp.StatusCode == 404 {
+			log.Printf("[DEBUG] No access to organization %s or it doesn't exist", orgName)
+			return false, nil
 		}
-	} else {
-		// For fine-grained tokens, check for repository and organization permissions
-		for _, scope := range token.Scopes {
-			if strings.HasPrefix(scope, "repository:") {
-				requiredScopes["repo"] = true
-			}
-			if strings.HasPrefix(scope, "organization:") {
-				requiredScopes["read:org"] = true
-			}
+		return false, fmt.Errorf("error checking organization access: %w", err)
+	}
+
+	if org != nil {
+		log.Printf("[INFO] Token has access to organization: %s", *org.Login)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// CheckRepositoryAccess checks if the token has access to a specific repository in an organization
+func (t *Token) CheckRepositoryAccess(ctx context.Context, orgName, repoName string) (bool, error) {
+	log.Printf("[DEBUG] Checking access to repository: %s/%s", orgName, repoName)
+
+	repo, resp, err := t.Client.Repositories.Get(ctx, orgName, repoName)
+	if err != nil {
+		if resp != nil && resp.StatusCode == 404 {
+			log.Printf("[DEBUG] No access to repository %s/%s or it doesn't exist", orgName, repoName)
+			return false, nil
 		}
+		return false, fmt.Errorf("error checking repository access: %w", err)
 	}
 
-	// Check if any required scopes are missing
-	missingScopes := []string{}
-	for scope, found := range requiredScopes {
-		if !found {
-			missingScopes = append(missingScopes, scope)
-		}
+	if repo != nil {
+		log.Printf("[INFO] Token has access to repository: %s/%s", orgName, *repo.Name)
+		return true, nil
 	}
 
-	if len(missingScopes) > 0 {
-		return fmt.Errorf("token missing required scopes: %s", strings.Join(missingScopes, ", "))
-	}
-
-	return nil
+	return false, nil
 }
 
 // GetTokenFromEnv attempts to get a GitHub token from environment variables
 func GetTokenFromEnv() string {
 	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		token = os.Getenv("ZIKRR_GITHUB_TOKEN")
+	if token != "" {
+		log.Printf("[DEBUG] Found token in GITHUB_TOKEN env var: %s****", token[:4])
+		return token
+	}
+
+	token = os.Getenv("ZIKRR_GITHUB_TOKEN")
+	if token != "" {
+		log.Printf("[DEBUG] Found token in ZIKRR_GITHUB_TOKEN env var: %s****", token[:4])
 	}
 	return token
 }
 
 // CreateGitHubClient creates a new GitHub client with the given token
 func CreateGitHubClient(ctx context.Context, token *Token) *github.Client {
+	log.Printf("[DEBUG] Creating GitHub client with token")
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token.Value},
 	)

@@ -39,7 +39,7 @@ type Model struct {
 }
 
 // NewModel creates a new TUI model
-func NewModel(ctx context.Context, client *gh.Client) Model {
+func NewModel(ctx context.Context, client *gh.Client, baseDir string, maxConcurrent int) Model {
 	return Model{
 		ctx:          ctx,
 		client:       client,
@@ -47,7 +47,7 @@ func NewModel(ctx context.Context, client *gh.Client) Model {
 		filter:       &gh.RepositoryFilter{},
 		organization: NewOrganizationModel(),
 		repositories: NewRepositoriesModel(),
-		progress:     NewProgressModel(),
+		progress:     NewProgressModel(baseDir, maxConcurrent),
 	}
 }
 
@@ -79,7 +79,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ViewRepositories:
 		return m.updateRepositoriesView(msg)
 	case ViewProgress:
-		return m.updateProgressView(msg)
+		return m.progress.Update(msg)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -93,7 +93,7 @@ func (m Model) View() string {
 	case ViewRepositories:
 		return m.repositoriesView()
 	case ViewProgress:
-		return m.progressView()
+		return m.progress.View()
 	default:
 		return "Unknown view"
 	}

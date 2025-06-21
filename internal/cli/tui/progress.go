@@ -1,143 +1,187 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
-	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	gh "github.com/sachin-duhan/zikrr/internal/github"
+	"github.com/sachin-duhan/zikrr/internal/git"
 )
 
-// progressBarWidth is the width of the progress bar
-const progressBarWidth = 50
+var (
+	statusColors = map[git.RepositoryStatus]lipgloss.Style{
+		git.StatusPending:  lipgloss.NewStyle().Foreground(lipgloss.Color("241")),
+		git.StatusCloning:  lipgloss.NewStyle().Foreground(lipgloss.Color("33")),
+		git.StatusRetrying: lipgloss.NewStyle().Foreground(lipgloss.Color("214")),
+		git.StatusSuccess:  lipgloss.NewStyle().Foreground(lipgloss.Color("42")),
+		git.StatusFailed:   lipgloss.NewStyle().Foreground(lipgloss.Color("196")),
+		git.StatusSkipped:  lipgloss.NewStyle().Foreground(lipgloss.Color("243")),
+		git.StatusUpdating: lipgloss.NewStyle().Foreground(lipgloss.Color("99")),
+	}
 
-// ProgressModel represents the cloning progress view
+	strategyNames = map[git.ExistingRepoStrategy]string{
+		git.SkipExisting:      "Skip",
+		git.OverwriteExisting: "Overwrite",
+		git.FetchOnly:         "Update",
+	}
+)
+
+// ProgressModel represents the progress view state
 type ProgressModel struct {
-	cloneProgress map[string]float64
-	totalProgress float64
-	currentOp     string
-	rateLimitInfo *gh.RateLimitInfo
-	error         error
+	repoManager *git.RepositoryManager
+	progress    progress.Model
+	width       int
+	height      int
+	done        bool
+	err         error
+	updates     <-chan *git.Repository
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // NewProgressModel creates a new progress model
-func NewProgressModel() *ProgressModel {
+func NewProgressModel(baseDir string, maxConcurrent int) *ProgressModel {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ProgressModel{
-		cloneProgress: make(map[string]float64),
+		repoManager: git.NewRepositoryManager(baseDir, maxConcurrent),
+		progress:    progress.New(progress.WithDefaultGradient()),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
-// updateProgressView handles updates for the progress view
-func (m Model) updateProgressView(msg tea.Msg) (tea.Model, tea.Cmd) {
+// AddRepository adds a repository to be cloned
+func (m *ProgressModel) AddRepository(org, name, url, branch string, strategy git.ExistingRepoStrategy) {
+	m.repoManager.AddRepository(org, name, url, branch, strategy)
+}
+
+// StartCloning starts the cloning process
+func (m *ProgressModel) StartCloning() tea.Cmd {
+	return func() tea.Msg {
+		m.updates = m.repoManager.CloneAll(m.ctx)
+		return nil
+	}
+}
+
+// Update handles model updates
+func (m *ProgressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
-	case progressMsg:
-		m.progress.cloneProgress[msg.repo] = msg.progress
-		m.progress.currentOp = msg.operation
-		return m, nil
-
-	case rateLimitMsg:
-		m.progress.rateLimitInfo = msg.info
-		return m, nil
-
-	case errMsg:
-		m.progress.error = msg.error
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.progress.Width = msg.Width - 4
 		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q":
-			if m.progress.totalProgress == 100 {
+		case "ctrl+c", "q":
+			m.cancel()
+			return m, tea.Quit
+		}
+	}
+
+	if m.updates != nil {
+		select {
+		case repo, ok := <-m.updates:
+			if !ok {
+				m.done = true
 				return m, tea.Quit
 			}
-		}
-	}
-	return m, nil
-}
-
-// progressView renders the cloning progress screen
-func (m Model) progressView() string {
-	var b strings.Builder
-
-	// Title
-	title := "Cloning Repositories"
-	b.WriteString(titleStyle.Render(title))
-	b.WriteString("\n\n")
-
-	// Overall progress
-	total := 0.0
-	for _, progress := range m.progress.cloneProgress {
-		total += progress
-	}
-	m.progress.totalProgress = total / float64(len(m.repositories.selectedRepos)) * 100
-
-	b.WriteString("Overall Progress:\n")
-	b.WriteString(renderProgressBar(m.progress.totalProgress))
-	b.WriteString(fmt.Sprintf(" %.1f%%\n\n", m.progress.totalProgress))
-
-	// Current operation
-	if m.progress.currentOp != "" {
-		b.WriteString(fmt.Sprintf("Current Operation: %s\n\n", m.progress.currentOp))
-	}
-
-	// Individual repository progress
-	b.WriteString("Repository Progress:\n")
-	for repo, progress := range m.progress.cloneProgress {
-		b.WriteString(fmt.Sprintf("%s:\n", repo))
-		b.WriteString(renderProgressBar(progress))
-		b.WriteString(fmt.Sprintf(" %.1f%%\n", progress))
-	}
-
-	// Rate limit info
-	if m.progress.rateLimitInfo != nil {
-		b.WriteString("\nGitHub API Rate Limit:\n")
-		b.WriteString(fmt.Sprintf("Remaining: %d/%d\n", m.progress.rateLimitInfo.Remaining, m.progress.rateLimitInfo.Limit))
-		if m.progress.rateLimitInfo.Remaining == 0 {
-			resetTime := time.Until(m.progress.rateLimitInfo.Reset).Round(time.Second)
-			b.WriteString(fmt.Sprintf("Reset in: %s\n", resetTime))
+			if repo != nil {
+				return m, nil
+			}
+		default:
 		}
 	}
 
-	// Instructions
-	if m.progress.totalProgress == 100 {
-		b.WriteString("\nAll repositories cloned successfully!\n")
-		b.WriteString(infoStyle.Render("Press 'q' to quit"))
-	}
+	prog, cmd := m.progress.Update(msg)
+	m.progress = prog.(progress.Model)
+	cmds = append(cmds, cmd)
 
-	// Error message
-	if m.progress.error != nil {
-		b.WriteString("\n\n")
-		b.WriteString(errorStyle.Render(m.progress.error.Error()))
-	}
-
-	return b.String()
+	return m, tea.Batch(cmds...)
 }
 
-// renderProgressBar creates a progress bar string
-func renderProgressBar(percent float64) string {
-	filled := int(percent / 100 * float64(progressBarWidth))
-	if filled > progressBarWidth {
-		filled = progressBarWidth
+// View renders the progress view
+func (m *ProgressModel) View() string {
+	if m.err != nil {
+		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
-	empty := progressBarWidth - filled
+	var s strings.Builder
+	s.WriteString("\n  Cloning Repositories\n\n")
 
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#00FF00")).
-		Render(fmt.Sprintf("[%s]", bar))
+	// Show repository status
+	repos := m.repoManager.GetRepositories()
+	total := len(repos)
+	completed := 0
+	skipped := 0
+	failed := 0
+
+	for _, repo := range repos {
+		status, err, progress := repo.GetStatus()
+		statusStyle := statusColors[status]
+
+		// Format repository line
+		repoLine := fmt.Sprintf("  %s/%s", repo.Organization, repo.Name)
+
+		// Add strategy for existing repos if relevant
+		if status == git.StatusSkipped || status == git.StatusUpdating {
+			repoLine += fmt.Sprintf(" [%s]", strategyNames[repo.ExistingRepo])
+		}
+
+		// Add progress or error information
+		if status == git.StatusCloning && progress != "" {
+			repoLine += fmt.Sprintf(" - %s", progress)
+		} else if status == git.StatusUpdating && progress != "" {
+			repoLine += fmt.Sprintf(" - %s", progress)
+		}
+		if err != nil {
+			repoLine += fmt.Sprintf(" - Error: %v", err)
+		}
+
+		s.WriteString(statusStyle.Render(repoLine) + "\n")
+
+		// Update counters
+		switch status {
+		case git.StatusSuccess:
+			completed++
+		case git.StatusSkipped:
+			skipped++
+		case git.StatusFailed:
+			failed++
+		}
+	}
+
+	// Show overall progress
+	s.WriteString("\n")
+	if total > 0 {
+		progress := float64(completed+skipped) / float64(total)
+		s.WriteString(fmt.Sprintf("  %s\n", m.progress.ViewAs(progress)))
+		s.WriteString(fmt.Sprintf("  Progress: %d/%d repositories\n", completed+skipped, total))
+		s.WriteString(fmt.Sprintf("  • Completed: %d\n", completed))
+		s.WriteString(fmt.Sprintf("  • Skipped: %d\n", skipped))
+		if failed > 0 {
+			s.WriteString(fmt.Sprintf("  • Failed: %d\n", failed))
+		}
+	}
+
+	// Show completion message
+	if m.done {
+		s.WriteString("\n  Done! Press q to exit\n")
+	}
+
+	return s.String()
 }
 
-// Custom messages for progress updates
-type (
-	progressMsg struct {
-		repo      string
-		progress  float64
-		operation string
-	}
-
-	rateLimitMsg struct {
-		info *gh.RateLimitInfo
-	}
-)
+// Init initializes the model
+func (m *ProgressModel) Init() tea.Cmd {
+	return tea.Batch(
+		m.progress.Init(),
+		m.StartCloning(),
+	)
+}

@@ -59,7 +59,7 @@ func run(cmd *cobra.Command, args []string) error {
 	client := github.NewClient(ctx, authToken)
 
 	// Create and run TUI
-	model := tui.NewModel(ctx, client)
+	model := tui.NewModel(ctx, client, ".", 5)
 
 	// If organization is provided via flag, pre-fill it
 	if org, _ := cmd.Flags().GetString("org"); org != "" {
