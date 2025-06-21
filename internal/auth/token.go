@@ -41,29 +41,31 @@ func ValidateToken(ctx context.Context, tokenValue string) (*Token, error) {
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
 
-	// Get token metadata
-	metadata, _, err := client.Auth.GetTokenMetadata(ctx)
+	// Get authenticated user to validate token
+	_, resp, err := client.Users.Get(ctx, "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get token metadata: %w", err)
+		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 
-	// Determine token type
+	// Get token scopes from response header
+	scopesHeader := resp.Header.Get("X-OAuth-Scopes")
+	scopes := []string{}
+	if scopesHeader != "" {
+		for _, scope := range strings.Split(scopesHeader, ",") {
+			scopes = append(scopes, strings.TrimSpace(scope))
+		}
+	}
+
+	// Determine token type based on scopes
 	tokenType := TokenTypeClassic
-	if metadata.ExpiresAt != nil {
+	if strings.Contains(scopesHeader, "repository:") || strings.Contains(scopesHeader, "organization:") {
 		tokenType = TokenTypeFineGrained
 	}
 
-	// Get token scopes
-	scopes := []string{}
-	if metadata.Scopes != nil {
-		scopes = *metadata.Scopes
-	}
-
 	token := &Token{
-		Value:     tokenValue,
-		Type:      tokenType,
-		Scopes:    scopes,
-		ExpiresAt: metadata.ExpiresAt,
+		Value:  tokenValue,
+		Type:   tokenType,
+		Scopes: scopes,
 	}
 
 	// Validate required scopes
